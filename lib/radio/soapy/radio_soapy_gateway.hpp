@@ -14,6 +14,7 @@
 #include <SoapySDR/Device.hpp>
 #include <cstdint>
 #include <memory>
+#include <atomic>
 
 namespace srsran {
 
@@ -52,6 +53,8 @@ private:
   std::unique_ptr<receiver_impl>    rx;
 
   double sampling_rate_hz = 0.0;
+
+  std::atomic<bool> running{false};
 };
 
 } // namespace srsran
