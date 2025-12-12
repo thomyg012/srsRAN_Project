@@ -39,13 +39,10 @@ if (ZEROMQ_FOUND AND ENABLE_ZEROMQ)
     list(APPEND SRSGNB_RADIO_LIBRARIES srsran_radio_zmq)
 endif (ZEROMQ_FOUND AND ENABLE_ZEROMQ)
 
-# Soapy Radio Backend
 if (ENABLE_SOAPY)
     add_subdirectory(soapy)
     list(APPEND SRSGNB_RADIO_DEFINITIONS -DENABLE_SOAPY)
-    # WICHTIG: NICHT in SRSGNB_RADIO_LIBRARIES aufnehmen!
-    # list(APPEND SRSGNB_RADIO_LIBRARIES srsran_radio_soapy)
-endif ()
+endif()
 
 add_definitions(${SRSGNB_RADIO_DEFINITIONS})
 target_link_libraries(srsran_radio ${SRSGNB_RADIO_LIBRARIES} srslog dl)

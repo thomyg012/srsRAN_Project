@@ -2,6 +2,12 @@
 #include "radio_soapy_gateway.hpp"
 
 #include <SoapySDR/Types.hpp>
+
+#include <algorithm>
+#include <complex>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace srsran {
@@ -11,35 +17,46 @@ namespace srsran {
 class radio_soapy_gateway::transmitter_impl : public baseband_gateway_transmitter
 {
 public:
-  transmitter_impl(SoapySDR::Device& dev_, SoapySDR::Stream* stream_) :
-    dev(dev_), stream(stream_)
-  {
-  }
+  transmitter_impl(SoapySDR::Device& dev_, SoapySDR::Stream* stream_) : dev(dev_), stream(stream_) {}
 
   void transmit(const baseband_gateway_buffer_reader&        data,
                 const baseband_gateway_transmitter_metadata& metadata) override
   {
-    // metadata aktuell nicht ausgewertet (kontinuierlicher Stream)
     (void)metadata;
 
-    // Wir gehen vorerst von genau einem Kanal aus (Channel 0).
-    auto     view        = data.get_channel_buffer(0);
-    unsigned nof_samples = data.get_nof_samples();
+    if (!stream) {
+      throw std::runtime_error("Soapy TX stream is null");
+    }
 
-    const void* buffs[1] = { static_cast<const void*>(view.data()) };
+    const unsigned nof_samples = data.get_nof_samples();
+    if (nof_samples == 0) {
+      return;
+    }
+
+    // srsRAN liefert SC16: span<const std::complex<short>>
+    auto view = data.get_channel_buffer(0);
+    if (!view.data()) {
+      throw std::runtime_error("srsRAN TX view.data() is null");
+    }
+
+    tmp_sc16.resize(nof_samples);
+    std::copy_n(view.data(), nof_samples, tmp_sc16.data());
+
+    const void* buffs[1] = { static_cast<const void*>(tmp_sc16.data()) };
 
     int       flags   = 0;
-    long long time_ns = 0; // ungenutzt, da keine Timed-Uebertragung
+    long long time_ns = 0;
 
-    int ret = dev.writeStream(stream, buffs, static_cast<int>(nof_samples), flags, time_ns);
+    const int ret = dev.writeStream(stream, buffs, static_cast<int>(nof_samples), flags, time_ns);
     if (ret < 0) {
-      // TODO: Logging einbauen, falls gewuenscht.
+      throw std::runtime_error("Soapy: writeStream() failed with code " + std::to_string(ret));
     }
   }
 
 private:
   SoapySDR::Device& dev;
   SoapySDR::Stream* stream = nullptr;
+  std::vector<std::complex<int16_t>> tmp_sc16;
 };
 
 // ---------- receiver_impl ----------
@@ -47,48 +64,101 @@ private:
 class radio_soapy_gateway::receiver_impl : public baseband_gateway_receiver
 {
 public:
-  receiver_impl(SoapySDR::Device& dev_, SoapySDR::Stream* stream_, double fs_) :
-    dev(dev_), stream(stream_), sampling_rate_hz(fs_)
+  receiver_impl(SoapySDR::Device& dev_,
+                SoapySDR::Stream* stream_,
+                double            sampling_rate_hz_) :
+    dev(dev_),
+    stream(stream_),
+    sampling_rate_hz(sampling_rate_hz_)
   {
   }
 
   metadata receive(baseband_gateway_buffer_writer& data) override
   {
     metadata md{};
+    md.ts = last_ts;
 
+    if (stream == nullptr) {
+      return md;
+    }
+
+    // Zielbuffer von srsRAN (complex<int16>)
     auto     view        = data.get_channel_buffer(0);
-    unsigned nof_samples = data.get_nof_samples();
+    unsigned req_samples = data.get_nof_samples();
 
-    void* buffs[1] = { static_cast<void*>(view.data()) };
+    // Soapy arbeitet mit CF32 → temporärer Buffer
+    tmp_cf32.resize(req_samples);
+
+    void* buffs[1] = { tmp_cf32.data() };
 
     int       flags   = 0;
     long long time_ns = 0;
 
-    int ret = dev.readStream(stream, buffs, static_cast<int>(nof_samples), flags, time_ns);
-    if (ret > 0) {
-      // einfache, monotone Sample-Zaehlung als Timestamp
-      last_ts += static_cast<baseband_gateway_timestamp>(ret);
+    // WICHTIG: Timeout, damit Ctrl+C funktioniert
+    constexpr long timeout_us = 100000; // 100 ms
+
+    const int ret = dev.readStream(stream,
+                                   buffs,
+                                   static_cast<int>(req_samples),
+                                   flags,
+                                   time_ns,
+                                   timeout_us);
+
+    // Timeout ist NORMAL → einfach nichts liefern
+    if (ret == SOAPY_SDR_TIMEOUT) {
+      md.ts = last_ts;
+      return md;
     }
 
-    md.ts = last_ts;
+    // Fehler → Exception (srsRAN stoppt sauber)
+    if (ret < 0) {
+      throw std::runtime_error(
+        "Soapy readStream failed with code " + std::to_string(ret));
+    }
+
+    // Anzahl effektiv gelesener Samples
+    const unsigned nread = static_cast<unsigned>(ret);
+    const unsigned ncopy = std::min(nread, req_samples);
+
+    // CF32 → CI16 (saubere Konversion, KEIN memcpy)
+    for (unsigned i = 0; i < ncopy; ++i) {
+      const float re = tmp_cf32[i].real();
+      const float im = tmp_cf32[i].imag();
+
+      // einfache Skalierung (1.0 → int16 max)
+      constexpr float scale = 32767.0f;
+
+      view[i].real(static_cast<int16_t>(
+        std::clamp(re * scale, -32768.0f, 32767.0f)));
+      view[i].imag(static_cast<int16_t>(
+        std::clamp(im * scale, -32768.0f, 32767.0f)));
+    }
+
+    last_ts += ncopy;
+    md.ts    = last_ts;
     return md;
   }
 
 private:
-  SoapySDR::Device&          dev;
-  SoapySDR::Stream*          stream           = nullptr;
-  double                     sampling_rate_hz = 0.0;
-  baseband_gateway_timestamp last_ts          = 0;
+  SoapySDR::Device& dev;
+  SoapySDR::Stream* stream = nullptr;
+
+  double sampling_rate_hz = 0.0;
+
+  baseband_gateway_timestamp last_ts = 0;
+
+  // temporärer CF32 RX-Buffer
+  std::vector<std::complex<float>> tmp_cf32;
 };
 
 // ---------- radio_soapy_gateway ----------
 
 radio_soapy_gateway::radio_soapy_gateway(SoapySDR::Device&                  dev_,
                                          double                             sampling_rate_hz_,
-                                         const radio_configuration::stream* tx_cfg,
-                                         const radio_configuration::stream* rx_cfg,
-                                         task_executor&                     async_task_executor,
-                                         radio_notification_handler&        notifier) :
+                                         const radio_configuration::stream*  tx_cfg,
+                                         const radio_configuration::stream*  rx_cfg,
+                                         task_executor&                      async_task_executor,
+                                         radio_notification_handler&         notifier) :
   dev(dev_),
   sampling_rate_hz(sampling_rate_hz_)
 {
@@ -97,13 +167,18 @@ radio_soapy_gateway::radio_soapy_gateway(SoapySDR::Device&                  dev_
   (void)async_task_executor;
   (void)notifier;
 
-  // aktuell: genau ein TX- und ein RX-Kanal (Index 0)
   std::vector<size_t> tx_channels = {0};
   std::vector<size_t> rx_channels = {0};
 
-  // Format als "CF32" (komplexe float32 Samples)
-  tx_stream = dev.setupStream(SOAPY_SDR_TX, "CF32", tx_channels);
-  rx_stream = dev.setupStream(SOAPY_SDR_RX, "CF32", rx_channels);
+  tx_stream = dev.setupStream(SOAPY_SDR_TX, "CS16", tx_channels);
+  if (!tx_stream) {
+    throw std::runtime_error("Soapy: setupStream(TX, CS16) failed");
+  }
+
+  rx_stream = dev.setupStream(SOAPY_SDR_RX, "CS16", rx_channels);
+  if (!rx_stream) {
+    throw std::runtime_error("Soapy: setupStream(RX, CS16) failed");
+  }
 
   tx = std::make_unique<transmitter_impl>(dev, tx_stream);
   rx = std::make_unique<receiver_impl>(dev, rx_stream, sampling_rate_hz);
@@ -138,20 +213,25 @@ unsigned radio_soapy_gateway::get_receiver_optimal_buffer_size() const
   if (!rx_stream) {
     return 0;
   }
-  // MTU gibt Anzahl Samples pro readStream() an
   return static_cast<unsigned>(dev.getStreamMTU(rx_stream));
 }
 
 void radio_soapy_gateway::start(baseband_gateway_timestamp init_time)
 {
-  // init_time wird momentan nicht an Soapy weitergereicht (kein Timed-Start)
   (void)init_time;
 
   if (tx_stream != nullptr) {
-    dev.activateStream(tx_stream, 0, 0, 0);
+    const int ret = dev.activateStream(tx_stream, 0, 0, 0);
+    if (ret != 0) {
+      throw std::runtime_error("Soapy: activateStream(TX) failed with code " + std::to_string(ret));
+    }
   }
+
   if (rx_stream != nullptr) {
-    dev.activateStream(rx_stream, 0, 0, 0);
+    const int ret = dev.activateStream(rx_stream, 0, 0, 0);
+    if (ret != 0) {
+      throw std::runtime_error("Soapy: activateStream(RX) failed with code " + std::to_string(ret));
+    }
   }
 }
 
